@@ -1,21 +1,32 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import fetch from 'node-fetch';
 
+// ====== Config ======
+const DEBUG = process.env.DEBUG === '1'; // pon DEBUG=1 para ver logs verbosos
+const ALLOWED_CHANNEL = process.env.ALLOWED_CHANNEL || '';
+
 // Receiver con endpoint /api/slack para Next/Vercel
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  endpoints: { events: '/api/slack' },
+  endpoints: { events: '/api/slack' }, // clave para que Slack valide el challenge en esta ruta
 });
 
+// App Bolt (serverless friendly)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
-  processBeforeResponse: true, // ack inmediato en serverless
+  processBeforeResponse: true, // ack inmediato en Vercel/Serverless
 });
 
-const ALLOWED_CHANNEL = process.env.ALLOWED_CHANNEL || '';
+// ====== Helpers de log ======
+function log(...args) {
+  if (DEBUG) console.log('[BOT]', ...args);
+}
+function logObj(label, obj) {
+  if (DEBUG) console.log(`[BOT] ${label}:`, JSON.stringify(obj, null, 2));
+}
 
-// --------- Utilidades de URL ----------
+// ====== Utilidades de URL ======
 function cleanSlackUrl(raw) {
   if (!raw) return '';
   let u = raw.trim();
@@ -24,14 +35,12 @@ function cleanSlackUrl(raw) {
   if (pipeIdx !== -1) u = u.slice(0, pipeIdx);
   return u.trim();
 }
-
 function extractUrls(text) {
   if (!text) return [];
   const urlRegex = /(https?:\/\/[^\s<>]+)/gi;
   const found = text.match(urlRegex) || [];
   return found.map(cleanSlackUrl);
 }
-
 function isSupportedMusicUrl(u) {
   try {
     const { hostname } = new URL(u);
@@ -44,12 +53,10 @@ function isSupportedMusicUrl(u) {
     return false;
   }
 }
-
 function pickFirstSupportedUrl(text) {
   const urls = extractUrls(text);
   return urls.find(isSupportedMusicUrl);
 }
-
 function isIgnorableMessage(message) {
   if (!message) return true;
   if (message.subtype === 'bot_message' || message.bot_id) return true;
@@ -57,17 +64,46 @@ function isIgnorableMessage(message) {
   return false;
 }
 
-// --------- Listener ---------
+// ====== Logs de arranque ======
+log('Inicializando bot…');
+log('Endpoint de eventos: /api/slack');
+log('ALLOWED_CHANNEL:', ALLOWED_CHANNEL || '(no restringido)');
+
+// ====== Listener principal ======
 app.message(async ({ message, client }) => {
   try {
     if (isIgnorableMessage(message)) return;
-    if (ALLOWED_CHANNEL && message.channel !== ALLOWED_CHANNEL) return;
 
+    log('Evento recibido:');
+    logObj('message', {
+      channel: message.channel,
+      user: message.user,
+      ts: message.ts,
+      thread_ts: message.thread_ts,
+      text: message.text,
+      subtype: message.subtype,
+      bot_id: message.bot_id
+    });
+
+    // Limitar a canal si corresponde
+    if (ALLOWED_CHANNEL && message.channel !== ALLOWED_CHANNEL) {
+      log('Ignorado por canal. channel=', message.channel);
+      return;
+    }
+
+    // Detectar URL soportada
     const candidate = pickFirstSupportedUrl(message.text || '');
+    log('URL candidata:', candidate || '(ninguna)');
     if (!candidate) return;
 
-    const res = await fetch(`https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(candidate)}`);
+    // Consultar song.link (Odesli)
+    const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(candidate)}`;
+    log('Fetching:', apiUrl);
+    const res = await fetch(apiUrl);
     const data = await res.json();
+    if (DEBUG) logObj('Odesli response (trimmed)', {
+      platforms: Object.keys(data?.linksByPlatform || {}),
+    });
 
     const spotify = data?.linksByPlatform?.spotify?.url;
     const apple = data?.linksByPlatform?.appleMusic?.url;
@@ -80,16 +116,25 @@ app.message(async ({ message, client }) => {
     if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
 
     const threadTs = message.thread_ts || message.ts;
+    log('Posteando en thread:', { channel: message.channel, threadTs, reply });
+
     await client.chat.postMessage({
       channel: message.channel,
       thread_ts: threadTs,
       text: reply,
+      // unfurl_links: false,
+      // unfurl_media: false,
     });
   } catch (err) {
     console.error('[BOT ERROR]', err);
   }
 });
 
-// Next.js API config (crítico para Slack)
+// ====== Handler global de errores Bolt ======
+app.error((error) => {
+  console.error('[BOLT ERROR]', error);
+});
+
+// ====== Next.js API config y export ======
 export const config = { api: { bodyParser: false } };
 export default receiver.app;
