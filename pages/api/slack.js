@@ -1,33 +1,33 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import fetch from 'node-fetch';
 
-// ====== Config ======
+// ===== Config =====
 const DEBUG = process.env.DEBUG === '1';
 
 // Canales permitidos (opcional). Ej: "C0123ABCDEF,C0456GHIJKL"
-// Si no seteas ALLOWED_CHANNELS, el bot responde en cualquier canal.
+// Si está vacío, responde en cualquier canal.
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Receiver con endpoint /api/slack para Next/Vercel
+// Receiver con endpoint /api/slack (Next/Vercel)
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: { events: '/api/slack' },
 });
 
+// ⚠️ Importante: SIN processBeforeResponse (ack inmediato por defecto)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
-  processBeforeResponse: true,
 });
 
-// ====== Helpers de log ======
+// ===== Helpers de log =====
 function log(...args) { if (DEBUG) console.log('[BOT]', ...args); }
 function logObj(label, obj) { if (DEBUG) console.log(`[BOT] ${label}:`, JSON.stringify(obj, null, 2)); }
 
-// ====== Utilidades de URL ======
+// ===== Utilidades URL =====
 function cleanSlackUrl(raw) {
   if (!raw) return '';
   let u = raw.trim();
@@ -63,77 +63,100 @@ function isIgnorableMessage(message) {
   return false;
 }
 
-// ====== Logs de arranque ======
-log('Inicializando bot…');
-log('Endpoint de eventos: /api/slack');
-log('ALLOWED_CHANNELS:', ALLOWED_CHANNELS.length ? ALLOWED_CHANNELS : '(no restringido)');
+// ===== Anti-duplicados (simple, por proceso) =====
+const seenEvents = new Set();
 
-// ====== Listener principal ======
-app.message(async ({ message, client }) => {
+// ===== Diagnóstico opcional =====
+app.event('message', async ({ event }) => {
+  logObj('event(message)', {
+    channel: event.channel, user: event.user, subtype: event.subtype, text: event.text, ts: event.ts
+  });
+});
+
+// ===== Listener principal =====
+app.message(async ({ message, client, body }) => {
   try {
+    // 0) Ack inmediato lo maneja Bolt (no usamos processBeforeResponse)
+    //    → No hacer await aquí antes de programar el trabajo pesado.
+
+    // 1) Filtros rápidos para salir ASAP
     if (isIgnorableMessage(message)) return;
 
-    log('Evento recibido:');
-    logObj('message', {
-      channel: message.channel,
-      user: message.user,
-      ts: message.ts,
-      thread_ts: message.thread_ts,
-      text: message.text,
-      subtype: message.subtype,
-      bot_id: message.bot_id
-    });
-
-    // ✅ Chequeo de canal (DENTRO del listener)
     const isChannelAllowed =
       !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(message.channel);
     if (!isChannelAllowed) {
-      log('Ignorado por canal. channel=', message.channel);
+      log('Ignorado por canal:', message.channel);
       return;
     }
 
-    // Detectar URL soportada
-    const candidate = pickFirstSupportedUrl(message.text || '');
-    log('URL candidata:', candidate || '(ninguna)');
-    if (!candidate) return;
+    // 2) **Programar** el trabajo pesado después del ack
+    //    Usamos setImmediate para que el ack salga primero.
+    setImmediate(async () => {
+      try {
+        // Idempotencia básica (si Slack reintenta el mismo evento)
+        const eventId = body?.event_id;
+        if (eventId) {
+          if (seenEvents.has(eventId)) {
+            log('Evento duplicado ignorado:', eventId);
+            return;
+          }
+          seenEvents.add(eventId);
+          // limpiar memoria simple (opcional)
+          if (seenEvents.size > 1000) {
+            // evitar crecer sin límite
+            seenEvents.clear();
+          }
+        }
 
-    // Consultar song.link (Odesli)
-    const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(candidate)}`;
-    log('Fetching:', apiUrl);
-    const res = await fetch(apiUrl);
-    const data = await res.json();
-    if (DEBUG) logObj('Odesli platforms', Object.keys(data?.linksByPlatform || {}));
+        log('Procesando mensaje…');
+        logObj('message', {
+          channel: message.channel, user: message.user, text: message.text, ts: message.ts, thread_ts: message.thread_ts
+        });
 
-    const spotify = data?.linksByPlatform?.spotify?.url;
-    const apple = data?.linksByPlatform?.appleMusic?.url;
-    const youtube = data?.linksByPlatform?.youtubeMusic?.url;
+        const candidate = pickFirstSupportedUrl(message.text || '');
+        log('URL candidata:', candidate || '(ninguna)');
+        if (!candidate) return;
 
-    let reply = '🎶 Links equivalentes:\n';
-    if (spotify) reply += `- Spotify: ${spotify}\n`;
-    if (apple) reply += `- Apple Music: ${apple}\n`;
-    if (youtube) reply += `- YouTube Music: ${youtube}\n`;
-    if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
+        const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(candidate)}`;
+        log('Fetching:', apiUrl);
+        const res = await fetch(apiUrl);
+        const data = await res.json();
+        if (DEBUG) logObj('Odesli platforms', Object.keys(data?.linksByPlatform || {}));
 
-    const threadTs = message.thread_ts || message.ts;
-    log('Posteando en thread:', { channel: message.channel, threadTs, reply });
+        const spotify = data?.linksByPlatform?.spotify?.url;
+        const apple = data?.linksByPlatform?.appleMusic?.url;
+        const youtube = data?.linksByPlatform?.youtubeMusic?.url;
 
-    await client.chat.postMessage({
-      channel: message.channel,
-      thread_ts: threadTs,
-      text: reply,
-      // unfurl_links: false,
-      // unfurl_media: false,
+        let reply = '🎶 Links equivalentes:\n';
+        if (spotify) reply += `- Spotify: ${spotify}\n`;
+        if (apple) reply += `- Apple Music: ${apple}\n`;
+        if (youtube) reply += `- YouTube Music: ${youtube}\n`;
+        if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
+
+        const threadTs = message.thread_ts || message.ts;
+        log('Posteando en thread:', { channel: message.channel, threadTs, reply });
+
+        await client.chat.postMessage({
+          channel: message.channel,
+          thread_ts: threadTs,
+          text: reply,
+          // unfurl_links: false,
+          // unfurl_media: false,
+        });
+      } catch (err) {
+        console.error('[BOT WORKER ERROR]', err);
+      }
     });
   } catch (err) {
     console.error('[BOT ERROR]', err);
   }
 });
 
-// ====== Handler global de errores Bolt ======
+// ===== Errores Bolt =====
 app.error((error) => {
   console.error('[BOLT ERROR]', error);
 });
 
-// ====== Next.js API config y export ======
+// ===== Next.js API export =====
 export const config = { api: { bodyParser: false } };
 export default receiver.app;
