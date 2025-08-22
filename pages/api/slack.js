@@ -3,7 +3,13 @@ import fetch from 'node-fetch';
 
 // ====== Config ======
 const DEBUG = process.env.DEBUG === '1'; // pon DEBUG=1 para ver logs verbosos
-const ALLOWED_CHANNEL = process.env.ALLOWED_CHANNEL || '';
+const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const isChannelAllowed = !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(message.channel);
+if (!isChannelAllowed) return;
 
 // Receiver con endpoint /api/slack para Next/Vercel
 const receiver = new ExpressReceiver({
