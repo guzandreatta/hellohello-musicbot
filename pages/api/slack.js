@@ -14,10 +14,12 @@ const receiver = new ExpressReceiver({
   endpoints: { events: '/api/slack' },
 });
 
-// ⚠️ Sin processBeforeResponse -> Bolt ackea de inmediato
+// ⚠️ processBeforeResponse: true → Bolt ackeará DESPUÉS de ejecutar el listener.
+// Mantén TODO debajo de ~2.5s para cumplir la ventana de Slack.
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
+  processBeforeResponse: true,
 });
 
 // ===== Logs helpers =====
@@ -53,16 +55,17 @@ function pickFirstSupportedUrl(text) {
   const urls = extractUrls(text);
   return urls.find(isSupportedMusicUrl);
 }
+
+// Permitimos message_changed para capturar URL cuando llega tras el unfurl
 function isIgnorableMessage(message) {
   if (!message) return true;
   if (message.subtype === 'bot_message' || message.bot_id) return true;
   if (message.subtype === 'message_deleted') return true;
-  // Permitimos message_changed por si la URL aparece tras unfurl
   return false;
 }
 
-// ===== fetch with timeout & retry =====
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
+// ===== fetch with timeout (1.8s) =====
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 1800) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -75,32 +78,14 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
 
 async function fetchOdesli(url) {
   const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(url)}`;
-  // intento 1
-  try {
-    log('Fetching (try 1):', apiUrl);
-    const res = await fetchWithTimeout(apiUrl, {}, 5000);
-    log('Odesli status (1):', res.status);
-    if (!res.ok) throw new Error(`odesli status ${res.status}`);
-    const data = await res.json();
-    return data;
-  } catch (e1) {
-    log('Odesli try 1 failed:', String(e1));
-    // intento 2
-    try {
-      log('Fetching (try 2):', apiUrl);
-      const res2 = await fetchWithTimeout(apiUrl, {}, 5000);
-      log('Odesli status (2):', res2.status);
-      if (!res2.ok) throw new Error(`odesli status ${res2.status}`);
-      const data2 = await res2.json();
-      return data2;
-    } catch (e2) {
-      log('Odesli try 2 failed:', String(e2));
-      throw e2;
-    }
-  }
+  log('Fetching Odesli:', apiUrl);
+  const res = await fetchWithTimeout(apiUrl, {}, 1800);
+  log('Odesli status:', res.status);
+  if (!res.ok) throw new Error(`odesli status ${res.status}`);
+  return res.json();
 }
 
-// ===== anti-duplicados =====
+// ===== anti-duplicados (simple) =====
 const seenEvents = new Set();
 
 // ===== diagnóstico de eventos =====
@@ -112,6 +97,7 @@ app.event('message', async ({ event }) => {
 
 // ===== listener principal =====
 app.message(async ({ message, client, body }) => {
+  const startedAt = Date.now();
   try {
     if (isIgnorableMessage(message)) return;
 
@@ -121,67 +107,70 @@ app.message(async ({ message, client, body }) => {
       return;
     }
 
-    // Programamos el trabajo post-ack
-    setImmediate(async () => {
-      try {
-        const eventId = body?.event_id;
-        if (eventId) {
-          if (seenEvents.has(eventId)) {
-            log('Evento duplicado ignorado:', eventId);
-            return;
-          }
-          seenEvents.add(eventId);
-          if (seenEvents.size > 1000) seenEvents.clear();
-        }
+    // Fallback de texto: si es message_changed, Slack suele enviar el texto en body.event.message.text
+    const text =
+      message.text ??
+      (body?.event?.message && typeof body.event.message.text === 'string' ? body.event.message.text : '');
 
-        log('Procesando mensaje…');
-        logObj('message', {
-          channel: message.channel, user: message.user, text: message.text, ts: message.ts, thread_ts: message.thread_ts, subtype: message.subtype
-        });
+    logObj('message', {
+      channel: message.channel,
+      user: message.user,
+      subtype: message.subtype,
+      ts: message.ts,
+      thread_ts: message.thread_ts,
+      text
+    });
 
-        const candidate = pickFirstSupportedUrl(message.text || '');
-        log('URL candidata:', candidate || '(ninguna)');
-        if (!candidate) return;
+    const candidate = pickFirstSupportedUrl(text || '');
+    log('URL candidata:', candidate || '(ninguna)');
+    if (!candidate) return;
 
-        let data;
-        try {
-          data = await fetchOdesli(candidate);
-        } catch (err) {
-          console.error('[BOT WORKER ERROR] Odesli timeout/failure:', err);
-          const threadTs = message.thread_ts || message.ts;
-          await client.chat.postMessage({
-            channel: message.channel,
-            thread_ts: threadTs,
-            text: '😕 No pude obtener equivalencias ahora (timeout). Intentá de nuevo en unos segundos.',
-          });
-          return;
-        }
-
-        if (DEBUG) logObj('Odesli platforms', Object.keys(data?.linksByPlatform || {}));
-
-        const spotify = data?.linksByPlatform?.spotify?.url;
-        const apple = data?.linksByPlatform?.appleMusic?.url;
-        const youtube = data?.linksByPlatform?.youtubeMusic?.url;
-
-        let reply = '🎶 Links equivalentes:\n';
-        if (spotify) reply += `- Spotify: ${spotify}\n`;
-        if (apple) reply += `- Apple Music: ${apple}\n`;
-        if (youtube) reply += `- YouTube Music: ${youtube}\n`;
-        if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
-
-        const threadTs = message.thread_ts || message.ts;
-        log('Posteando en thread:', { channel: message.channel, threadTs, reply });
-
-        await client.chat.postMessage({
-          channel: message.channel,
-          thread_ts: threadTs,
-          text: reply,
-          // unfurl_links: false,
-          // unfurl_media: false,
-        });
-      } catch (err) {
-        console.error('[BOT WORKER ERROR]', err);
+    // Idempotencia por event_id (evita doble post en reintentos)
+    const eventId = body?.event_id;
+    if (eventId) {
+      if (seenEvents.has(eventId)) {
+        log('Evento duplicado ignorado:', eventId);
+        return;
       }
+      seenEvents.add(eventId);
+      if (seenEvents.size > 1000) seenEvents.clear();
+    }
+
+    let data;
+    try {
+      data = await fetchOdesli(candidate);
+    } catch (err) {
+      console.error('[BOT] Odesli timeout/failure:', err);
+      const threadTs = message.thread_ts || message.ts || body?.event?.ts;
+      await client.chat.postMessage({
+        channel: message.channel,
+        thread_ts: threadTs,
+        text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
+      });
+      return;
+    }
+
+    logObj('Odesli platforms', Object.keys(data?.linksByPlatform || {}));
+
+    const spotify = data?.linksByPlatform?.spotify?.url;
+    const apple = data?.linksByPlatform?.appleMusic?.url;
+    const youtube = data?.linksByPlatform?.youtubeMusic?.url;
+
+    let reply = '🎶 Links equivalentes:\n';
+    if (spotify) reply += `- Spotify: ${spotify}\n`;
+    if (apple) reply += `- Apple Music: ${apple}\n`;
+    if (youtube) reply += `- YouTube Music: ${youtube}\n`;
+    if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
+
+    const threadTs = message.thread_ts || message.ts || body?.event?.ts;
+    log('Posteando en thread:', { channel: message.channel, threadTs, tookMs: Date.now() - startedAt });
+
+    await client.chat.postMessage({
+      channel: message.channel,
+      thread_ts: threadTs,
+      text: reply,
+      // unfurl_links: false,
+      // unfurl_media: false,
     });
   } catch (err) {
     console.error('[BOT ERROR]', err);
