@@ -3,9 +3,6 @@ import fetch from 'node-fetch';
 
 // ===== Config =====
 const DEBUG = process.env.DEBUG === '1';
-
-// Canales permitidos (opcional). Ej: "C0123ABCDEF,C0456GHIJKL"
-// Si está vacío, responde en cualquier canal.
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
@@ -17,17 +14,17 @@ const receiver = new ExpressReceiver({
   endpoints: { events: '/api/slack' },
 });
 
-// ⚠️ Importante: SIN processBeforeResponse (ack inmediato por defecto)
+// ⚠️ Sin processBeforeResponse -> Bolt ackea de inmediato
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
 });
 
-// ===== Helpers de log =====
+// ===== Logs helpers =====
 function log(...args) { if (DEBUG) console.log('[BOT]', ...args); }
 function logObj(label, obj) { if (DEBUG) console.log(`[BOT] ${label}:`, JSON.stringify(obj, null, 2)); }
 
-// ===== Utilidades URL =====
+// ===== URL utils =====
 function cleanSlackUrl(raw) {
   if (!raw) return '';
   let u = raw.trim();
@@ -59,41 +56,74 @@ function pickFirstSupportedUrl(text) {
 function isIgnorableMessage(message) {
   if (!message) return true;
   if (message.subtype === 'bot_message' || message.bot_id) return true;
-  if (message.subtype === 'message_changed' || message.subtype === 'message_deleted') return true;
+  if (message.subtype === 'message_deleted') return true;
+  // Permitimos message_changed por si la URL aparece tras unfurl
   return false;
 }
 
-// ===== Anti-duplicados (simple, por proceso) =====
+// ===== fetch with timeout & retry =====
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function fetchOdesli(url) {
+  const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(url)}`;
+  // intento 1
+  try {
+    log('Fetching (try 1):', apiUrl);
+    const res = await fetchWithTimeout(apiUrl, {}, 5000);
+    log('Odesli status (1):', res.status);
+    if (!res.ok) throw new Error(`odesli status ${res.status}`);
+    const data = await res.json();
+    return data;
+  } catch (e1) {
+    log('Odesli try 1 failed:', String(e1));
+    // intento 2
+    try {
+      log('Fetching (try 2):', apiUrl);
+      const res2 = await fetchWithTimeout(apiUrl, {}, 5000);
+      log('Odesli status (2):', res2.status);
+      if (!res2.ok) throw new Error(`odesli status ${res2.status}`);
+      const data2 = await res2.json();
+      return data2;
+    } catch (e2) {
+      log('Odesli try 2 failed:', String(e2));
+      throw e2;
+    }
+  }
+}
+
+// ===== anti-duplicados =====
 const seenEvents = new Set();
 
-// ===== Diagnóstico opcional =====
+// ===== diagnóstico de eventos =====
 app.event('message', async ({ event }) => {
   logObj('event(message)', {
     channel: event.channel, user: event.user, subtype: event.subtype, text: event.text, ts: event.ts
   });
 });
 
-// ===== Listener principal =====
+// ===== listener principal =====
 app.message(async ({ message, client, body }) => {
   try {
-    // 0) Ack inmediato lo maneja Bolt (no usamos processBeforeResponse)
-    //    → No hacer await aquí antes de programar el trabajo pesado.
-
-    // 1) Filtros rápidos para salir ASAP
     if (isIgnorableMessage(message)) return;
 
-    const isChannelAllowed =
-      !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(message.channel);
+    const isChannelAllowed = !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(message.channel);
     if (!isChannelAllowed) {
       log('Ignorado por canal:', message.channel);
       return;
     }
 
-    // 2) **Programar** el trabajo pesado después del ack
-    //    Usamos setImmediate para que el ack salga primero.
+    // Programamos el trabajo post-ack
     setImmediate(async () => {
       try {
-        // Idempotencia básica (si Slack reintenta el mismo evento)
         const eventId = body?.event_id;
         if (eventId) {
           if (seenEvents.has(eventId)) {
@@ -101,26 +131,32 @@ app.message(async ({ message, client, body }) => {
             return;
           }
           seenEvents.add(eventId);
-          // limpiar memoria simple (opcional)
-          if (seenEvents.size > 1000) {
-            // evitar crecer sin límite
-            seenEvents.clear();
-          }
+          if (seenEvents.size > 1000) seenEvents.clear();
         }
 
         log('Procesando mensaje…');
         logObj('message', {
-          channel: message.channel, user: message.user, text: message.text, ts: message.ts, thread_ts: message.thread_ts
+          channel: message.channel, user: message.user, text: message.text, ts: message.ts, thread_ts: message.thread_ts, subtype: message.subtype
         });
 
         const candidate = pickFirstSupportedUrl(message.text || '');
         log('URL candidata:', candidate || '(ninguna)');
         if (!candidate) return;
 
-        const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(candidate)}`;
-        log('Fetching:', apiUrl);
-        const res = await fetch(apiUrl);
-        const data = await res.json();
+        let data;
+        try {
+          data = await fetchOdesli(candidate);
+        } catch (err) {
+          console.error('[BOT WORKER ERROR] Odesli timeout/failure:', err);
+          const threadTs = message.thread_ts || message.ts;
+          await client.chat.postMessage({
+            channel: message.channel,
+            thread_ts: threadTs,
+            text: '😕 No pude obtener equivalencias ahora (timeout). Intentá de nuevo en unos segundos.',
+          });
+          return;
+        }
+
         if (DEBUG) logObj('Odesli platforms', Object.keys(data?.linksByPlatform || {}));
 
         const spotify = data?.linksByPlatform?.spotify?.url;
@@ -152,7 +188,7 @@ app.message(async ({ message, client, body }) => {
   }
 });
 
-// ===== Errores Bolt =====
+// ===== errores Bolt =====
 app.error((error) => {
   console.error('[BOLT ERROR]', error);
 });
