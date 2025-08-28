@@ -3,7 +3,6 @@ import fetch from 'node-fetch';
 
 // ===== Config =====
 const DEBUG = process.env.DEBUG === '1';
-// Permite uno o varios canales (IDs separados por coma). Si lo dejas vacío, responde en todos.
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
@@ -86,8 +85,8 @@ function isIgnorableEvent(ev) {
   return false;
 }
 
-// ===== fetch con timeout (2.2s, un intento) =====
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 2200) {
+// ===== fetch con timeout utilitario =====
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 1200) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -96,15 +95,26 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 2200) {
     clearTimeout(id);
   }
 }
+
+// ===== Odesli (rápido) =====
 async function fetchOdesli(url) {
   const normalized = normalizeCandidate(url);
   const apiUrl = `https://api.song.link/v1-alpha.1/links?userCountry=US&url=${encodeURIComponent(normalized)}`;
   const headers = { 'user-agent': 'hellohello-musicbot/1.0' };
 
   log('Fetching Odesli:', apiUrl);
-  const r = await fetchWithTimeout(apiUrl, { headers }, 2200);
+  const r = await fetchWithTimeout(apiUrl, { headers }, 1200);
   log('Odesli status:', r.status);
   if (!r.ok) throw new Error(`odesli status ${r.status}`);
+  return await r.json();
+}
+
+// ===== Spotify oEmbed (para fallback) =====
+async function fetchSpotifyOEmbed(spotifyUrl) {
+  const url = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`;
+  const r = await fetchWithTimeout(url, {}, 900);
+  if (!r.ok) throw new Error(`spotify oembed ${r.status}`);
+  // Ejemplo: { title: "Song — Artist", author_name: "Artist", ... }
   return await r.json();
 }
 
@@ -153,60 +163,78 @@ app.event('message', async ({ event, client, body }) => {
     const candidate = normalizeCandidate(candidateRaw);
     log('URL candidata NORMALIZADA:', candidate);
 
-    // 3) Cache / Odesli
+    // 3) Intento Odesli (rápido) o cache
     let data = getCached(candidate);
-    if (!data) {
-      try {
+    let reply = '';
+    let usedFallback = false;
+
+    try {
+      if (!data) {
         data = await fetchOdesli(candidate);
         setCached(candidate, data);
-      } catch (err) {
-        console.error('[BOT] Odesli failure:', String(err));
-        const threadTs = event.thread_ts || event.ts;
-        // Fallback visible al usuario: timeout
-        try {
-          await client.chat.postMessage({
-            channel,
-            thread_ts: threadTs,
-            text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
-          });
-          log('Fallback de timeout enviado.');
-        } catch (ePost) {
-          console.error('[BOT] chat.postMessage error (fallback):', ePost?.data || ePost);
-          // Si no puede postear (no invitado / restringido), avisa por ephemeral
-          const reason = ePost?.data?.error;
-          if (reason === 'not_in_channel' || reason === 'restricted_action') {
-            try {
-              await client.chat.postEphemeral({
-                channel,
-                user: event.user,
-                text: 'No tengo permiso para publicar en este canal. Invitame con `/invite @TuBot` o habilitá permisos.',
-              });
-              log('Aviso ephemeral enviado (fallback).');
-            } catch (eph) {
-              console.error('[BOT] chat.postEphemeral error:', eph?.data || eph);
-            }
-          }
-        }
-        return;
+      } else {
+        log('Cache hit para URL');
       }
-    } else {
-      log('Cache hit para URL');
+
+      const platforms = Object.keys(data?.linksByPlatform || {});
+      logObj('Odesli platforms', platforms);
+
+      const spotify = data?.linksByPlatform?.spotify?.url;
+      const apple = data?.linksByPlatform?.appleMusic?.url;
+      const youtube = data?.linksByPlatform?.youtubeMusic?.url;
+
+      reply = '🎶 Links equivalentes:\n';
+      if (spotify) reply += `- Spotify: ${spotify}\n`;
+      if (apple) reply += `- Apple Music: ${apple}\n`;
+      if (youtube) reply += `- YouTube Music: ${youtube}\n`;
+      if (reply === '🎶 Links equivalentes:\n') reply = ''; // fuerza fallback abajo
+    } catch (err) {
+      log('[BOT] Odesli fallback path:', String(err));
+      usedFallback = true;
     }
 
-    const platforms = Object.keys(data?.linksByPlatform || {});
-    logObj('Odesli platforms', platforms);
+    // 4) Fallback sin Odesli (rápido y siempre visible)
+    if (!reply) {
+      const u = new URL(candidate);
+      const host = u.hostname.toLowerCase();
 
-    const spotify = data?.linksByPlatform?.spotify?.url;
-    const apple = data?.linksByPlatform?.appleMusic?.url;
-    const youtube = data?.linksByPlatform?.youtubeMusic?.url;
+      // Preparar texto de búsqueda
+      let searchText = candidate;
+      try {
+        if (host.includes('spotify')) {
+          // usar oEmbed para obtener "Song — Artist"
+          const meta = await fetchSpotifyOEmbed(candidate);
+          const title = meta?.title || '';
+          const author = meta?.author_name || '';
+          const merged = [title, author].filter(Boolean).join(' ');
+          searchText = merged || candidate;
+          log('oEmbed title/author:', { title, author, merged });
+        } else if (host.includes('youtube')) {
+          // usar la URL como query; YT a veces tarda en oEmbed
+          searchText = candidate;
+        } else if (host.includes('apple')) {
+          // limpiar parámetros
+          searchText = decodeURIComponent(u.pathname.replace(/\/+/g, ' ').trim());
+        }
+      } catch (e) {
+        log('Fallback meta fetch failed:', String(e));
+      }
 
-    let reply = '🎶 Links equivalentes:\n';
-    if (spotify) reply += `- Spotify: ${spotify}\n`;
-    if (apple) reply += `- Apple Music: ${apple}\n`;
-    if (youtube) reply += `- YouTube Music: ${youtube}\n`;
-    if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
+      // construir búsquedas cruzadas
+      const q = encodeURIComponent(searchText);
+      const appleSearch = `https://music.apple.com/us/search?term=${q}`;
+      const ytMusicSearch = `https://music.youtube.com/search?q=${q}`;
+      const spotifySearch = `https://open.spotify.com/search/${q}`;
 
-    const threadTs = event.thread_ts || event.ts;
+      reply = '🎶 No pude confirmar equivalencias exactas ahora, probá con estas búsquedas:\n';
+      if (!host.includes('spotify')) reply += `- Spotify (búsqueda): ${spotifySearch}\n`;
+      if (!host.includes('apple')) reply += `- Apple Music (búsqueda): ${appleSearch}\n`;
+      if (!host.includes('youtube')) reply += `- YouTube Music (búsqueda): ${ytMusicSearch}\n`;
+      if (usedFallback) reply += '_(modo rápido por latencia de Odesli)_';
+    }
+
+    // 5) Postear en thread (usar ts de message_changed si existe)
+    const threadTs = event.message?.ts || event.thread_ts || event.ts;
     log('Posteando en thread (pre):', { channel, thread_ts: threadTs });
 
     try {
@@ -214,15 +242,12 @@ app.event('message', async ({ event, client, body }) => {
         channel,
         thread_ts: threadTs,
         text: reply,
-        // unfurl_links: false,
-        // unfurl_media: false,
       });
       log('Posteado OK:', { ts: resp.ts });
     } catch (e) {
       const errData = e?.data || e;
       console.error('[BOT] chat.postMessage error:', errData);
 
-      // Si no puede postear en el canal, avisá al usuario con ephemeral
       const reason = errData?.error;
       if (reason === 'not_in_channel' || reason === 'restricted_action') {
         try {
