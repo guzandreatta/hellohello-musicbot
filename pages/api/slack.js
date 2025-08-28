@@ -1,18 +1,13 @@
-// pages/api/slack.js
 import { App, ExpressReceiver } from '@slack/bolt';
 import fetch from 'node-fetch';
 
-// ===== Config mínima =====
-const VERSION = 'v5-simple';
-const DEBUG = process.env.DEBUG === '1';
-
-// Canales permitidos (opcional). Dejar vacío para todos.
+// ===== Config =====
+const DEBUG = true; // activamos siempre logs
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Timeout para Odesli. En Vercel lo capamos a ~2.4s para cumplir con Slack.
 const RAW_TIMEOUT_MS = Number(process.env.ODESLI_TIMEOUT_MS || '2000');
 const IS_VERCEL = !!process.env.VERCEL;
 const ODESLI_TIMEOUT_MS = IS_VERCEL ? Math.min(RAW_TIMEOUT_MS, 2400) : RAW_TIMEOUT_MS;
@@ -25,12 +20,9 @@ const receiver = new ExpressReceiver({
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
-  processBeforeResponse: true, // respondemos rápido a Slack
+  processBeforeResponse: true,
 });
 
-const log = (...a) => { if (DEBUG) console.log('[BOT]', ...a); };
-
-// ===== Helpers muy básicos =====
 function cleanAngle(s) {
   if (!s) return '';
   let x = s.trim();
@@ -41,33 +33,26 @@ function cleanAngle(s) {
 function extractUrls(text) {
   if (!text) return [];
   const urlRegex = /(https?:\/\/[^\s<>]+)/gi;
-  const found = text.match(urlRegex) || [];
-  return found.map(cleanAngle);
+  return (text.match(urlRegex) || []).map(cleanAngle);
 }
 function isMusicUrl(u) {
   try {
     const h = new URL(u).hostname.toLowerCase();
     return (
-      h.endsWith('open.spotify.com') ||
-      h === 'spotify.link' ||
-      h.endsWith('music.apple.com') ||
-      h.endsWith('itunes.apple.com') ||
-      h.endsWith('music.youtube.com') ||
-      h.endsWith('youtube.com') ||
+      h.includes('spotify') ||
+      h.includes('music.apple.com') ||
+      h.includes('youtube') ||
       h === 'youtu.be'
     );
   } catch { return false; }
 }
 function pickMusicUrlFromEvent(ev) {
-  const text = typeof ev.text === 'string' ? ev.text : (ev.message?.text || '');
+  const text = ev.text || ev.message?.text || '';
   const fromText = extractUrls(text).find(isMusicUrl);
   if (fromText) return fromText;
-
-  const atts = ev?.message?.attachments || ev?.attachments || [];
+  const atts = ev?.message?.attachments || [];
   for (const a of atts) {
     if (a?.from_url && isMusicUrl(a.from_url)) return a.from_url;
-    if (a?.title_link && isMusicUrl(a.title_link)) return a.title_link;
-    if (a?.original_url && isMusicUrl(a.original_url)) return a.original_url;
   }
   return null;
 }
@@ -76,8 +61,10 @@ async function fetchWithTimeout(url, ms) {
   const ac = new AbortController();
   const id = setTimeout(() => ac.abort(), ms);
   try {
-    const r = await fetch(url, { signal: ac.signal, headers: { 'Accept': 'application/json', 'User-Agent': 'music-bot/1.0' } });
-    return r;
+    return await fetch(url, {
+      signal: ac.signal,
+      headers: { 'Accept': 'application/json', 'User-Agent': 'music-bot/1.0' }
+    });
   } finally {
     clearTimeout(id);
   }
@@ -85,67 +72,69 @@ async function fetchWithTimeout(url, ms) {
 
 async function getOdesli(url) {
   const api = `https://api.song.link/v1-alpha.1/links?userCountry=US&url=${encodeURIComponent(url)}`;
+  console.log('[BOT] → Consultando Odesli:', api);
   const r = await fetchWithTimeout(api, ODESLI_TIMEOUT_MS);
+  const text = await r.text();
+  console.log('[BOT] Odesli status:', r.status, '| size:', text.length);
+  console.log('[BOT] Odesli respuesta (sample):', text.slice(0, 200));
   if (!r.ok) throw new Error(`odesli ${r.status}`);
-  return r.json(); // { linksByPlatform: { spotify, appleMusic, youtubeMusic, ... } }
+  const data = JSON.parse(text);
+  console.log('[BOT] Odesli linksByPlatform:', JSON.stringify(data.linksByPlatform, null, 2));
+  return data;
 }
 
-// ===== Listener único y simple =====
 app.event('message', async ({ event, client }) => {
   try {
-    // Ignorar mensajes de bots, borrados, etc.
-    if (!event || event.bot_id || event.subtype === 'bot_message' || event.subtype === 'message_deleted') return;
+    if (!event || event.bot_id || event.subtype === 'bot_message') return;
+    if (ALLOWED_CHANNELS.length && !ALLOWED_CHANNELS.includes(event.channel)) return;
 
-    // Canal permitido
-    const ch = event.channel;
-    if (ALLOWED_CHANNELS.length && !ALLOWED_CHANNELS.includes(ch)) return;
+    console.log('[BOT] Nuevo mensaje:', JSON.stringify(event, null, 2));
 
-    // Detectar URL de música
     const raw = pickMusicUrlFromEvent(event);
-    if (!raw) return;
+    if (!raw) {
+      console.log('[BOT] No se detectó URL de música.');
+      return;
+    }
 
     const url = raw.replace(/&amp;/g, '&').trim();
+    console.log('[BOT] URL candidata:', url);
 
-    // Consultar Odesli con timeout corto
     let data;
     try {
       data = await getOdesli(url);
     } catch (e) {
-      log('Odesli no disponible/timeout:', String(e));
-      return; // silencio total: no postear
+      console.error('[BOT] Error/timeout en Odesli:', e);
+      return;
     }
 
     const by = data?.linksByPlatform || {};
-    const sp = by?.spotify?.url || null;
-    const ap = by?.appleMusic?.url || null;
-    const yt = by?.youtubeMusic?.url || null;
+    const sp = by?.spotify?.url;
+    const ap = by?.appleMusic?.url;
+    const yt = by?.youtubeMusic?.url;
 
-    // Si no hay equivalencias útiles, no postear
-    if (!sp && !ap && !yt) return;
+    if (!sp && !ap && !yt) {
+      console.log('[BOT] Odesli no devolvió equivalencias.');
+      return;
+    }
 
-    // Armar respuesta breve
     let txt = '🎶 ';
     const parts = [];
     if (sp) parts.push(`Spotify: ${sp}`);
     if (ap) parts.push(`Apple Music: ${ap}`);
     if (yt) parts.push(`YouTube Music: ${yt}`);
     txt += parts.join(' • ');
-    if (!parts.length) return;
 
-    const threadTs = event.message?.ts || event.thread_ts || event.ts;
-
-    // Postear en el thread del mensaje original
     await client.chat.postMessage({
-      channel: ch,
-      thread_ts: threadTs,
+      channel: event.channel,
+      thread_ts: event.ts,
       text: txt,
     });
+    console.log('[BOT] Posteado en thread OK.');
 
   } catch (err) {
     console.error('[BOT ERROR]', err);
   }
 });
 
-// ===== Next.js API export =====
 export const config = { api: { bodyParser: false } };
 export default receiver.app;
