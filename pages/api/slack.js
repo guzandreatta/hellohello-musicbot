@@ -1,14 +1,13 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import fetch from 'node-fetch';
 
-const VERSION = 'v4.1-odesli-extended';
+const VERSION = 'v4.2-setTimeout-worker';
 const DEBUG = process.env.DEBUG === '1';
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Ahora permitimos hasta 8s reales (sin cap en Vercel)
 const ODESLI_TIMEOUT_MS = Number(process.env.ODESLI_TIMEOUT_MS || '8000');
 
 const receiver = new ExpressReceiver({
@@ -59,7 +58,7 @@ async function fetchOdesli(url) {
   const api = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(url)}`;
   const r = await fetch(api, { headers: { 'User-Agent': 'hellohello-musicbot/1.0' } });
   const raw = await r.text();
-  log('[ODESLI RAW SAMPLE]', raw.slice(0, 300));
+  console.log('[BOT] Odesli raw size:', raw.length, '| status:', r.status);
   if (!r.ok) throw new Error(`odesli status ${r.status}`);
   const data = JSON.parse(raw);
   console.log('[ODESLI DATA linksByPlatform]', JSON.stringify(data.linksByPlatform, null, 2));
@@ -100,26 +99,36 @@ app.event('message', async ({ event, client }) => {
       console.error('[BOT] provisional error', e.data || e);
     }
 
-    // Fetch Odesli en background
-    (async () => {
+    // Worker en background con setTimeout
+    setTimeout(async () => {
+      console.log('[BOT] Background worker lanzado para', url);
+
       let finalText = '';
       try {
         const data = await Promise.race([
           fetchOdesli(url),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('odesli-timeout')), ODESLI_TIMEOUT_MS))
+          new Promise((_, rej) =>
+            setTimeout(() => {
+              console.error('[BOT] Timeout Odesli tras', ODESLI_TIMEOUT_MS, 'ms');
+              rej(new Error('odesli-timeout'));
+            }, ODESLI_TIMEOUT_MS)
+          )
         ]);
+
         const sp = data?.linksByPlatform?.spotify?.url;
         const ap = data?.linksByPlatform?.appleMusic?.url;
         const yt = data?.linksByPlatform?.youtubeMusic?.url;
+
         finalText = ':notes: Links equivalentes:\n';
         if (sp) finalText += `- Spotify: ${sp}\n`;
         if (ap) finalText += `- Apple Music: ${ap}\n`;
         if (yt) finalText += `- YouTube Music: ${yt}\n`;
+
         if (finalText === ':notes: Links equivalentes:\n') {
           finalText = buildFallback(url);
         }
       } catch (err) {
-        log('Odesli fallback', String(err));
+        console.error('[BOT] Odesli error o timeout', err);
         finalText = buildFallback(url);
       }
 
@@ -138,10 +147,11 @@ app.event('message', async ({ event, client }) => {
             text: finalText,
           });
         }
+        console.log('[BOT] Mensaje actualizado/posteado OK');
       } catch (e) {
         console.error('[BOT] update/post error', e.data || e);
       }
-    })();
+    }, 0);
 
   } catch (err) {
     console.error('[BOT ERROR]', err);
