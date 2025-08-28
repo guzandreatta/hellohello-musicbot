@@ -1,29 +1,27 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import fetch from 'node-fetch';
 
-// ===== Config =====
-const VERSION = 'v4-hybrid-update';
+const VERSION = 'v4.1-odesli-extended';
 const DEBUG = process.env.DEBUG === '1';
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-const ODESLI_TIMEOUT_MS = Number(process.env.ODESLI_TIMEOUT_MS || '8000'); // ahora más alto
-const IS_VERCEL = !!process.env.VERCEL;
+// Ahora permitimos hasta 8s reales (sin cap en Vercel)
+const ODESLI_TIMEOUT_MS = Number(process.env.ODESLI_TIMEOUT_MS || '8000');
 
-// Receiver para Next/Vercel
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: { events: '/api/slack' },
 });
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
   processBeforeResponse: true,
 });
 
-// ===== Helpers =====
 const log = (...a) => { if (DEBUG) console.log('[BOT]', ...a); };
 
 function normalizeCandidate(u) {
@@ -58,10 +56,14 @@ function pickUrlFromEvent(ev) {
 
 // ===== Odesli =====
 async function fetchOdesli(url) {
-  const api = `https://api.song.link/v1-alpha.1/links?userCountry=US&url=${encodeURIComponent(url)}`;
+  const api = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(url)}`;
   const r = await fetch(api, { headers: { 'User-Agent': 'hellohello-musicbot/1.0' } });
+  const raw = await r.text();
+  log('[ODESLI RAW SAMPLE]', raw.slice(0, 300));
   if (!r.ok) throw new Error(`odesli status ${r.status}`);
-  return r.json();
+  const data = JSON.parse(raw);
+  console.log('[ODESLI DATA linksByPlatform]', JSON.stringify(data.linksByPlatform, null, 2));
+  return data;
 }
 
 // ===== Fallback =====
@@ -85,7 +87,7 @@ app.event('message', async ({ event, client }) => {
     const url = normalizeCandidate(rawUrl);
     const threadTs = event.message?.ts || event.ts;
 
-    // 1) Provisional inmediato
+    // Provisional inmediato
     let provisionalTs = null;
     try {
       const resp = await client.chat.postMessage({
@@ -98,7 +100,7 @@ app.event('message', async ({ event, client }) => {
       console.error('[BOT] provisional error', e.data || e);
     }
 
-    // 2) Fetch Odesli en background (sin bloquear respuesta a Slack)
+    // Fetch Odesli en background
     (async () => {
       let finalText = '';
       try {
@@ -113,12 +115,15 @@ app.event('message', async ({ event, client }) => {
         if (sp) finalText += `- Spotify: ${sp}\n`;
         if (ap) finalText += `- Apple Music: ${ap}\n`;
         if (yt) finalText += `- YouTube Music: ${yt}\n`;
+        if (finalText === ':notes: Links equivalentes:\n') {
+          finalText = buildFallback(url);
+        }
       } catch (err) {
         log('Odesli fallback', String(err));
         finalText = buildFallback(url);
       }
 
-      // 3) Update el provisional
+      // Update el provisional
       try {
         if (provisionalTs) {
           await client.chat.update({
