@@ -3,6 +3,7 @@ import fetch from 'node-fetch';
 
 // ===== Config =====
 const DEBUG = process.env.DEBUG === '1';
+const FAST_MODE = process.env.FAST_MODE === '1';
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
@@ -14,7 +15,7 @@ const receiver = new ExpressReceiver({
   endpoints: { events: '/api/slack' },
 });
 
-// ⚠️ Bolt espera al listener (sin background). Mantener <~2.5s.
+// ⚠️ Bolt espera al listener. Mantener <~2.5s.
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
@@ -24,6 +25,7 @@ const app = new App({
 // ===== Logs =====
 const log = (...a) => { if (DEBUG) console.log('[BOT]', ...a); };
 const logObj = (label, obj) => { if (DEBUG) console.log(`[BOT] ${label}:`, JSON.stringify(obj, null, 2)); };
+log('Boot | FAST_MODE=', FAST_MODE ? 'ON' : 'OFF', '| ALLOWED_CHANNELS=', ALLOWED_CHANNELS.join(',') || '(all)');
 
 // ===== URL utils =====
 function cleanSlackUrl(raw) {
@@ -52,8 +54,7 @@ function normalizeCandidate(u) {
   let s = (u || '').replace(/&amp;/g, '&').replace(/\u00A0/g, ' ').trim();
   try { return new URL(s).toString(); } catch { return s; }
 }
-const pickFirstSupportedUrlFromText = (text) =>
-  extractUrls(text).find(isSupportedMusicUrl);
+const pickFirstSupportedUrlFromText = (text) => extractUrls(text).find(isSupportedMusicUrl);
 
 // Para unfurls: a veces el link viene en attachments
 function pickUrlFromEvent(ev) {
@@ -81,7 +82,7 @@ function isIgnorableEvent(ev) {
   return false;
 }
 
-// ===== fetch con timeout corto (2.2s, un intento) =====
+// ===== fetch con timeout corto =====
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 2200) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -91,6 +92,8 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 2200) {
     clearTimeout(id);
   }
 }
+
+// ===== Odesli (cuando NO está FAST_MODE) =====
 async function fetchOdesli(url) {
   const normalized = normalizeCandidate(url);
   const apiUrl = `https://api.song.link/v1-alpha.1/links?userCountry=US&url=${encodeURIComponent(normalized)}`;
@@ -103,7 +106,7 @@ async function fetchOdesli(url) {
   return await r.json();
 }
 
-// ===== Spotify oEmbed (fallback rápido) =====
+// ===== Spotify oEmbed (fallback/FAST_MODE) =====
 async function fetchSpotifyOEmbed(spotifyUrl) {
   const url = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`;
   const r = await fetchWithTimeout(url, {}, 900);
@@ -135,10 +138,7 @@ app.event('message', async ({ event, client, body }) => {
     if (!allowed) { log('Ignorado por canal:', channel); return; }
 
     log('Procesando event(message)…');
-    logObj('event(raw)', {
-      channel, user: event.user, subtype: event.subtype, ts: event.ts,
-      text: typeof event.text === 'string' ? event.text : undefined
-    });
+    logObj('event(raw)', { channel, user: event.user, subtype: event.subtype, ts: event.ts });
 
     // 1) URL candidata
     const candidateRaw = pickUrlFromEvent(event);
@@ -156,18 +156,29 @@ app.event('message', async ({ event, client, body }) => {
     const candidate = normalizeCandidate(candidateRaw);
     log('URL candidata NORMALIZADA:', candidate);
 
-    // 3) Intento Odesli OR cache
-    let data = getCached(candidate);
+    const threadTs = event.message?.ts || event.thread_ts || event.ts;
+
+    // 3) Resolver equivalencias
     let reply = '';
+    let data = null;
 
-    try {
-      if (!data) {
-        data = await fetchOdesli(candidate);
-        setCached(candidate, data);
-      } else {
-        log('Cache hit para URL');
+    if (!FAST_MODE) {
+      try {
+        data = getCached(candidate);
+        if (!data) {
+          data = await fetchOdesli(candidate);
+          setCached(candidate, data);
+        } else {
+          log('Cache hit para URL');
+        }
+      } catch (err) {
+        log('[BOT] Odesli falló/tardó, usaré fallback:', String(err));
       }
+    } else {
+      log('FAST_MODE=ON → salto Odesli y voy a fallback');
+    }
 
+    if (data?.linksByPlatform) {
       const spotify = data?.linksByPlatform?.spotify?.url;
       const apple = data?.linksByPlatform?.appleMusic?.url;
       const youtube = data?.linksByPlatform?.youtubeMusic?.url;
@@ -176,13 +187,11 @@ app.event('message', async ({ event, client, body }) => {
       if (spotify) reply += `- Spotify: ${spotify}\n`;
       if (apple) reply += `- Apple Music: ${apple}\n`;
       if (youtube) reply += `- YouTube Music: ${youtube}\n`;
-      if (reply === '🎶 Links equivalentes:\n') reply = ''; // fuerza fallback abajo
-    } catch (err) {
-      log('[BOT] Odesli falló/tardó, usando fallback:', String(err));
+      if (reply === '🎶 Links equivalentes:\n') reply = ''; // si no hay nada, forzar fallback
     }
 
-    // 4) Fallback si no hay reply (búsquedas cruzadas, rápido)
     if (!reply) {
+      // ===== Fallback rápido (siempre disponible) =====
       const u = new URL(candidate);
       const host = u.hostname.toLowerCase();
       let searchText = candidate;
@@ -209,11 +218,10 @@ app.event('message', async ({ event, client, body }) => {
       if (!host.includes('spotify')) reply += `- Spotify (búsqueda): ${spotifySearch}\n`;
       if (!host.includes('apple')) reply += `- Apple Music (búsqueda): ${appleSearch}\n`;
       if (!host.includes('youtube')) reply += `- YouTube Music (búsqueda): ${ytMusicSearch}\n`;
-      reply += '_(modo rápido por latencia de Odesli)_';
+      if (!FAST_MODE) reply += ' _(modo rápido por latencia de Odesli)_';
     }
 
-    // 5) Postear en thread del mensaje original (para message_changed usamos event.message.ts)
-    const threadTs = event.message?.ts || event.thread_ts || event.ts;
+    // 4) Postear en thread
     log('Posteando en thread (pre):', { channel, thread_ts: threadTs });
 
     try {
