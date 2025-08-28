@@ -3,7 +3,7 @@ import fetch from 'node-fetch';
 
 // ===== Config =====
 const DEBUG = process.env.DEBUG === '1';
-// Permitir uno o varios canales (C... / G...). Si lo dejas vacío, responde en todos.
+// Permite uno o varios canales (IDs separados por coma). Si lo dejas vacío, responde en todos.
 const ALLOWED_CHANNELS = (process.env.ALLOWED_CHANNELS || '')
   .split(',')
   .map(s => s.trim())
@@ -15,8 +15,7 @@ const receiver = new ExpressReceiver({
   endpoints: { events: '/api/slack' },
 });
 
-// ⚠️ Importante: esperamos al listener para responder (ack controlado)
-// Mantener todo < ~2.5s para entrar en la ventana de Slack (3s).
+// Esperamos al listener (ack controlado). Mantener <~2.5s para ventana de Slack (3s).
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
@@ -51,7 +50,7 @@ function isSupportedMusicUrl(u) {
   } catch { return false; }
 }
 function normalizeCandidate(u) {
-  // corrige &amp; y espacios NBSP
+  // corrige &amp; y NBSP
   let s = u.replace(/&amp;/g, '&').replace(/\u00A0/g, ' ').trim();
   try { return new URL(s).toString(); } catch { return s; }
 }
@@ -59,7 +58,7 @@ function pickFirstSupportedUrlFromText(text) {
   return extractUrls(text).find(isSupportedMusicUrl);
 }
 
-// Para unfurls: a veces el link viene en attachments/title_link o from_url
+// Para unfurls: a veces el link viene en attachments
 function pickUrlFromEvent(event) {
   const text =
     typeof event.text === 'string' ? event.text :
@@ -69,7 +68,7 @@ function pickUrlFromEvent(event) {
   let url = pickFirstSupportedUrlFromText(text || '');
   if (url) return url;
 
-  // 2) de attachments (unfurl)
+  // 2) de attachments del unfurl
   const atts = event?.message?.attachments || event?.attachments || [];
   for (const a of atts) {
     if (a?.from_url && isSupportedMusicUrl(a.from_url)) return a.from_url;
@@ -87,7 +86,7 @@ function isIgnorableEvent(ev) {
   return false;
 }
 
-// ===== fetch con timeout (2.2s, un solo intento) =====
+// ===== fetch con timeout (2.2s, un intento) =====
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 2200) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -120,15 +119,15 @@ function getCached(url) {
 }
 function setCached(url, data) { cache.set(url, { data, at: Date.now() }); }
 
-// ===== anti-duplicados: solo si ya tenemos URL candidata =====
+// ===== anti-duplicados (solo si hay URL) =====
 const seenEvents = new Set();
 
 // ===== ÚNICO listener para todos los mensajes (incluye message_changed) =====
 app.event('message', async ({ event, client, body }) => {
   try {
-    const channel = event.channel;
     if (isIgnorableEvent(event)) return;
 
+    const channel = event.channel;
     const allowed = !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(channel);
     if (!allowed) { log('Ignorado por canal:', channel); return; }
 
@@ -138,7 +137,7 @@ app.event('message', async ({ event, client, body }) => {
       text: typeof event.text === 'string' ? event.text : undefined
     });
 
-    // 1) Buscar la URL (texto o attachments de unfurl)
+    // 1) Encontrar la URL (texto o attachments)
     const candidateRaw = pickUrlFromEvent(event);
     log('URL candidata RAW:', candidateRaw || '(ninguna)');
     if (!candidateRaw) return;
@@ -154,20 +153,40 @@ app.event('message', async ({ event, client, body }) => {
     const candidate = normalizeCandidate(candidateRaw);
     log('URL candidata NORMALIZADA:', candidate);
 
-    // 3) Cache y Odesli
+    // 3) Cache / Odesli
     let data = getCached(candidate);
     if (!data) {
       try {
         data = await fetchOdesli(candidate);
         setCached(candidate, data);
       } catch (err) {
-        console.error('[BOT] Odesli timeout/failure:', err);
+        console.error('[BOT] Odesli failure:', String(err));
         const threadTs = event.thread_ts || event.ts;
-        await client.chat.postMessage({
-          channel,
-          thread_ts: threadTs,
-          text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
-        });
+        // Fallback visible al usuario: timeout
+        try {
+          await client.chat.postMessage({
+            channel,
+            thread_ts: threadTs,
+            text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
+          });
+          log('Fallback de timeout enviado.');
+        } catch (ePost) {
+          console.error('[BOT] chat.postMessage error (fallback):', ePost?.data || ePost);
+          // Si no puede postear (no invitado / restringido), avisa por ephemeral
+          const reason = ePost?.data?.error;
+          if (reason === 'not_in_channel' || reason === 'restricted_action') {
+            try {
+              await client.chat.postEphemeral({
+                channel,
+                user: event.user,
+                text: 'No tengo permiso para publicar en este canal. Invitame con `/invite @TuBot` o habilitá permisos.',
+              });
+              log('Aviso ephemeral enviado (fallback).');
+            } catch (eph) {
+              console.error('[BOT] chat.postEphemeral error:', eph?.data || eph);
+            }
+          }
+        }
         return;
       }
     } else {
@@ -188,15 +207,36 @@ app.event('message', async ({ event, client, body }) => {
     if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
 
     const threadTs = event.thread_ts || event.ts;
-    log('Posteando en thread:', { channel, thread_ts: threadTs });
+    log('Posteando en thread (pre):', { channel, thread_ts: threadTs });
 
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: reply,
-      // unfurl_links: false,
-      // unfurl_media: false,
-    });
+    try {
+      const resp = await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: reply,
+        // unfurl_links: false,
+        // unfurl_media: false,
+      });
+      log('Posteado OK:', { ts: resp.ts });
+    } catch (e) {
+      const errData = e?.data || e;
+      console.error('[BOT] chat.postMessage error:', errData);
+
+      // Si no puede postear en el canal, avisá al usuario con ephemeral
+      const reason = errData?.error;
+      if (reason === 'not_in_channel' || reason === 'restricted_action') {
+        try {
+          await client.chat.postEphemeral({
+            channel,
+            user: event.user,
+            text: 'No tengo permiso para publicar en este canal. Invitame con `/invite @TuBot` o habilitá permisos.',
+          });
+          log('Aviso ephemeral enviado.');
+        } catch (eph) {
+          console.error('[BOT] chat.postEphemeral error:', eph?.data || eph);
+        }
+      }
+    }
   } catch (err) {
     console.error('[BOT WORKER ERROR]', err);
   }
