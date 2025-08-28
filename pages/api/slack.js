@@ -48,26 +48,20 @@ function isSupportedMusicUrl(u) {
   } catch { return false; }
 }
 function normalizeCandidate(u) {
-  // Corrige entidades HTML y espacios extraños antes de encodear
+  // Corrige &amp; y espacios no-break
   let s = u.replace(/&amp;/g, '&').replace(/\u00A0/g, ' ').trim();
   try {
-    // round-trip para “limpiar” y normalizar
     const parsed = new URL(s);
-    // (opcional) quitar tracking típico:
-    // parsed.searchParams.delete('utm_source');
-    // parsed.searchParams.delete('utm_medium');
     return parsed.toString();
-  } catch {
-    return s; // si no parsea, devuelve tal cual
-  }
+  } catch { return s; }
 }
-const pickFirstSupportedUrl = (text) => (extractUrls(text).find(isSupportedMusicUrl));
+const pickFirstSupportedUrl = (text) => extractUrls(text).find(isSupportedMusicUrl);
 
-// Permitimos message_changed (unfurl)
-function isIgnorableMessageLike(m) {
-  if (!m) return true;
-  if (m.subtype === 'bot_message' || m.bot_id) return true;
-  if (m.subtype === 'message_deleted') return true;
+// ===== filtros =====
+function isIgnorableEvent(ev) {
+  if (!ev) return true;
+  if (ev.subtype === 'bot_message' || ev.bot_id) return true;
+  if (ev.subtype === 'message_deleted') return true;
   return false;
 }
 
@@ -86,7 +80,6 @@ async function fetchOdesli(url) {
   const apiUrl = `https://api.song.link/v1-alpha.1/links?userCountry=US&url=${encodeURIComponent(normalized)}`;
   const headers = { 'user-agent': 'hellohello-musicbot/1.0' };
 
-  // try 1
   try {
     log('Fetching Odesli (1):', apiUrl);
     const r = await fetchWithTimeout(apiUrl, { headers }, 6000);
@@ -95,7 +88,6 @@ async function fetchOdesli(url) {
     return await r.json();
   } catch (e1) {
     log('Odesli try 1 failed:', String(e1));
-    // try 2
     try {
       log('Fetching Odesli (2):', apiUrl);
       const r2 = await fetchWithTimeout(apiUrl, { headers }, 6000);
@@ -109,7 +101,7 @@ async function fetchOdesli(url) {
   }
 }
 
-// ===== cache en memoria (10 min) =====
+// ===== cache (10 min) =====
 const cache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
 function getCached(url) {
@@ -120,139 +112,97 @@ function getCached(url) {
 }
 function setCached(url, data) { cache.set(url, { data, at: Date.now() }); }
 
-// ===== anti-duplicados =====
+// ===== anti-duplicados (marcar solo si hay URL candidata) =====
 const seenEvents = new Set();
 
-// ===== diagnóstico de eventos =====
-app.event('message', async ({ event }) => {
-  logObj('event(message)', {
-    channel: event.channel, user: event.user, subtype: event.subtype, text: event.text, ts: event.ts
-  });
-});
-
-// ===== procesador común =====
-async function handleMessageLike({ channel, user, text, ts, thread_ts, subtype }, client, body) {
-  if (isIgnorableMessageLike({ subtype })) return;
-
-  const allowed = !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(channel);
-  if (!allowed) { log('Ignorado por canal:', channel); return; }
-
-  const eventId = body?.event_id;
-  if (eventId) {
-    if (seenEvents.has(eventId)) { log('Evento duplicado ignorado:', eventId); return; }
-    seenEvents.add(eventId);
-    if (seenEvents.size > 2000) seenEvents.clear();
-  }
-
-  const candidateRaw = pickFirstSupportedUrl(text || '');
-  log('URL candidata RAW:', candidateRaw || '(ninguna)');
-  if (!candidateRaw) return;
-
-  const candidate = normalizeCandidate(candidateRaw);
-  log('URL candidata NORMALIZADA:', candidate);
-
-  let data = getCached(candidate);
-  if (!data) {
-    try {
-      data = await fetchOdesli(candidate);
-      setCached(candidate, data);
-    } catch (err) {
-      console.error('[BOT] Odesli timeout/failure:', err);
-      const tts = thread_ts || ts || body?.event?.ts;
-      await client.chat.postMessage({
-        channel,
-        thread_ts: tts,
-        text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
-      });
-      return;
-    }
-  } else {
-    log('Cache hit para URL');
-  }
-
-  const platforms = Object.keys(data?.linksByPlatform || {});
-  logObj('Odesli platforms', platforms);
-
-  const spotify = data?.linksByPlatform?.spotify?.url;
-  const apple = data?.linksByPlatform?.appleMusic?.url;
-  const youtube = data?.linksByPlatform?.youtubeMusic?.url;
-
-  let reply = '🎶 Links equivalentes:\n';
-  if (spotify) reply += `- Spotify: ${spotify}\n`;
-  if (apple) reply += `- Apple Music: ${apple}\n`;
-  if (youtube) reply += `- YouTube Music: ${youtube}\n`;
-  if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
-
-  const tts = thread_ts || ts || body?.event?.ts;
-  log('Posteando en thread:', { channel, thread_ts: tts });
-
-  await client.chat.postMessage({
-    channel,
-    thread_ts: tts,
-    text: reply,
-    // unfurl_links: false,
-    // unfurl_media: false,
-  });
-}
-
-// ===== listeners =====
-app.message(async ({ message, client, body }) => {
-  try {
-    // Ack inmediato → programamos trabajo en background
-    setImmediate(async () => {
-      try {
-        log('Procesando message…');
-        logObj('message', {
-          channel: message.channel, user: message.user, text: message.text,
-          ts: message.ts, thread_ts: message.thread_ts, subtype: message.subtype
-        });
-        await handleMessageLike({
-          channel: message.channel,
-          user: message.user,
-          text: message.text,
-          ts: message.ts,
-          thread_ts: message.thread_ts,
-          subtype: message.subtype
-        }, client, body);
-      } catch (err) {
-        console.error('[BOT WORKER ERROR app.message]', err);
-      }
-    });
-  } catch (err) {
-    console.error('[BOT ERROR app.message]', err);
-  }
-});
-
-// Incluimos también los "message_changed" para unfurls
+// ===== único listener para todos los mensajes (incluye message_changed) =====
 app.event('message', async ({ event, client, body }) => {
   try {
+    // Ack inmediato → hacemos el trabajo en background
     setImmediate(async () => {
       try {
+        if (isIgnorableEvent(event)) return;
+
+        const channel = event.channel;
+        const allowed = !ALLOWED_CHANNELS.length || ALLOWED_CHANNELS.includes(channel);
+        if (!allowed) { log('Ignorado por canal:', channel); return; }
+
+        // Texto: event.text o event.message.text cuando subtype=message_changed
         const text = typeof event.text === 'string'
           ? event.text
           : (event.message && typeof event.message.text === 'string' ? event.message.text : '');
+
         log('Procesando event(message)…');
-        logObj('event(raw)', event);
-        await handleMessageLike({
-          channel: event.channel,
-          user: event.user,
-          text,
-          ts: event.ts,
-          thread_ts: event.thread_ts,
-          subtype: event.subtype
-        }, client, body);
+        logObj('event(raw)', {
+          channel, user: event.user, subtype: event.subtype, ts: event.ts, text
+        });
+
+        // Detectar URL primero (NO dedupe aún)
+        const candidateRaw = pickFirstSupportedUrl(text || '');
+        log('URL candidata RAW:', candidateRaw || '(ninguna)');
+        if (!candidateRaw) return;
+
+        // Ahora sí, dedupe por event_id (evitamos quemar eventos sin URL)
+        const eventId = body?.event_id;
+        if (eventId) {
+          if (seenEvents.has(eventId)) { log('Evento duplicado ignorado:', eventId); return; }
+          seenEvents.add(eventId);
+          if (seenEvents.size > 2000) seenEvents.clear();
+        }
+
+        const candidate = normalizeCandidate(candidateRaw);
+        log('URL candidata NORMALIZADA:', candidate);
+
+        // Cache
+        let data = getCached(candidate);
+        if (!data) {
+          try {
+            data = await fetchOdesli(candidate);
+            setCached(candidate, data);
+          } catch (err) {
+            console.error('[BOT] Odesli timeout/failure:', err);
+            const tts = event.thread_ts || event.ts;
+            await client.chat.postMessage({
+              channel,
+              thread_ts: tts,
+              text: '😕 No pude obtener equivalencias ahora (timeout). Probá de nuevo en unos segundos.',
+            });
+            return;
+          }
+        } else {
+          log('Cache hit para URL');
+        }
+
+        const platforms = Object.keys(data?.linksByPlatform || {});
+        logObj('Odesli platforms', platforms);
+
+        const spotify = data?.linksByPlatform?.spotify?.url;
+        const apple = data?.linksByPlatform?.appleMusic?.url;
+        const youtube = data?.linksByPlatform?.youtubeMusic?.url;
+
+        let reply = '🎶 Links equivalentes:\n';
+        if (spotify) reply += `- Spotify: ${spotify}\n`;
+        if (apple) reply += `- Apple Music: ${apple}\n`;
+        if (youtube) reply += `- YouTube Music: ${youtube}\n`;
+        if (reply === '🎶 Links equivalentes:\n') reply = 'No pude encontrar equivalencias 😕';
+
+        const threadTs = event.thread_ts || event.ts;
+        log('Posteando en thread:', { channel, thread_ts: threadTs });
+
+        await client.chat.postMessage({
+          channel,
+          thread_ts: threadTs,
+          text: reply,
+          // unfurl_links: false,
+          // unfurl_media: false,
+        });
       } catch (err) {
-        console.error('[BOT WORKER ERROR app.event]', err);
+        console.error('[BOT WORKER ERROR]', err);
       }
     });
   } catch (err) {
-    console.error('[BOT ERROR app.event]', err);
+    console.error('[BOLT ERROR]', err);
   }
-});
-
-// ===== errores Bolt =====
-app.error((error) => {
-  console.error('[BOLT ERROR]', error);
 });
 
 // ===== Next.js API export =====
